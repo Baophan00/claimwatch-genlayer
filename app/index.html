@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ClaimWatch — what the page said, on chain</title>
+<meta name="description" content="Register a claim about a public URL and let GenLayer validators read the page and record, on chain, whether it still backs the claim." />
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#ffffff; --ink:#1b2330; --muted:#6b7686; --line:#e3e7ec;
+    --accent:#2f5fd0; --ok:#1f7a4d; --warn:#9a5b00; --bad:#a32b2b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+  .wrap{max-width:1080px;margin:0 auto;padding:28px 20px 80px}
+  header.top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:22px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:650;letter-spacing:-.01em;font-size:19px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--ok)}
+  .chips{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .chip{border:1px solid var(--line);background:#fff;border-radius:999px;padding:6px 12px;font-size:12.5px;color:var(--muted)}
+  .chip b{color:var(--ink);font-weight:600}
+  h2{font-size:15px;font-weight:650;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:13px;margin:0 0 14px}
+  .grid{display:grid;grid-template-columns:1fr 340px;gap:18px;align-items:start}
+  @media(max-width:900px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px}
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:18px}
+  .stat{background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .stat span{display:block;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+  .stat b{font-size:20px;font-weight:650}
+  label{display:block;font-size:12.5px;color:var(--muted);margin:10px 0 4px}
+  input,textarea,select{width:100%;border:1px solid var(--line);border-radius:8px;padding:9px 11px;
+    font:inherit;color:var(--ink);background:#fff}
+  textarea{min-height:74px;resize:vertical}
+  input:focus,textarea:focus,select:focus{outline:2px solid #cdd9f5;border-color:#b9c9ee}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  button{font:inherit;border-radius:8px;border:1px solid var(--line);background:#fff;color:var(--ink);
+    padding:9px 14px;cursor:pointer}
+  button:hover{border-color:#cfd6e0}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.primary:hover{background:#27519f}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.small{padding:6px 10px;font-size:13px}
+  .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  .watch{border:1px solid var(--line);border-radius:12px;background:#fff;padding:16px;margin-bottom:12px}
+  .watch h3{margin:0 0 6px;font-size:15.5px;font-weight:650}
+  .meta{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+  .pill{font-size:11.5px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);color:var(--muted);background:#fbfcfd}
+  .pill.supported{color:var(--ok);border-color:#cfe8db;background:#f1faf5}
+  .pill.contradicted{color:var(--bad);border-color:#f0d2d2;background:#fdf3f3}
+  .pill.unclear{color:var(--warn);border-color:#f0dfc2;background:#fdf8ef}
+  .kv{font-size:13px;color:var(--muted);margin:3px 0}
+  .kv b{color:var(--ink);font-weight:550}
+  .verdict{margin-top:10px;border-left:3px solid var(--line);padding:8px 12px;background:#fafbfc;border-radius:0 8px 8px 0;font-size:13.5px}
+  .verdict b{display:block;margin-bottom:2px}
+  .verdict q{color:#3d4a5c;font-style:italic}
+  .history{margin-top:10px;border-top:1px dashed var(--line);padding-top:8px;font-size:12.5px;color:var(--muted)}
+  .history div{margin:4px 0}
+  .log{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;background:#1b2330;color:#fff;
+    padding:10px 16px;border-radius:10px;font-size:13px;max-width:90vw;display:none;z-index:9}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+  .hint{font-size:12px;color:var(--muted);margin-top:6px}
+  footer{margin-top:26px;color:var(--muted);font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand"><span class="dot" id="netdot"></span>ClaimWatch</div>
+    <div class="chips">
+      <div class="chip">Network <b id="netname">Studio</b></div>
+      <div class="chip">Contract <a id="contractlink" class="mono" target="_blank" rel="noreferrer">—</a></div>
+      <div class="chip" id="walletchip">No key</div>
+    </div>
+  </header>
+
+  <div class="stats" id="stats"></div>
+
+  <div class="grid">
+    <section>
+      <div class="sub" style="margin-bottom:10px">Watches on chain. Each check is a consensus round: validators fetch the page themselves and record the verdict with the sentence they relied on.</div>
+      <div id="list"></div>
+    </section>
+
+    <aside>
+      <div class="card" style="margin-bottom:14px">
+        <h2>Your key</h2>
+        <p class="sub">Held in this browser only. Studio Network is a test network, never put real funds behind a key you paste here.</p>
+        <label for="acting">Acting as</label>
+        <select id="acting"></select>
+        <div class="mono" id="addr" style="word-break:break-all;font-size:12px;color:#3d4a5c;margin-top:8px">no key yet</div>
+        <div class="actions">
+          <button class="small" id="genkey">Add a key</button>
+          <button class="small" id="importkey">Import key</button>
+        </div>
+        <div class="hint">Any key can run a check. Creating a watch is free on Studio.</div>
+      </div>
+
+      <div class="card">
+        <h2>New watch</h2>
+        <p class="sub">One claim about one public URL. Keep it short enough that a reader can say yes or no.</p>
+        <label for="f-url">Page URL</label>
+        <input id="f-url" placeholder="https://docs.example.com/pricing" />
+        <label for="f-claim">What the page is supposed to say</label>
+        <textarea id="f-claim" placeholder="The free tier includes 1,000 requests per month."></textarea>
+        <div class="actions"><button class="primary" id="create">Create watch</button></div>
+      </div>
+    </aside>
+  </div>
+
+  <footer>
+    Reads go through the GenLayer RPC. A verdict is written by validators who fetched the page during the consensus round, so a later check can show when the page stopped backing the claim.
+  </footer>
+</div>
+<div class="log" id="log"></div>
+<script src="./bundle.js"></script>
+</body>
+</html>

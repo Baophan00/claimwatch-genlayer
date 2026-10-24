@@ -1,0 +1,5 @@
+node_modules/
+.venv/
+artifacts/
+scripts/.e2e-keys.json
+.pytest_cache/
