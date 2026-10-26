@@ -3,3 +3,7 @@ node_modules/
 artifacts/
 scripts/.e2e-keys.json
 .pytest_cache/
+__pycache__/
+*.pyc
+scripts/.e2e-keys.json
+app/attest.txt
