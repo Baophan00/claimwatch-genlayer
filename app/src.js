@@ -1,7 +1,7 @@
 import { createClient, createAccount, generatePrivateKey } from "genlayer-js";
 import { studionet } from "genlayer-js/chains";
 
-const CONTRACT = "0xeF409e591f41e16D01B1A2f061d8b2B085eB0bF7";
+const CONTRACT = "0xca60Ef61C9B3f4383174131067B72e392a877Ba0";
 const EXPLORER = `https://explorer-studio.genlayer.com/address/${CONTRACT}`;
 const KEY_SLOT = "claimwatch.keys";
 
@@ -142,7 +142,8 @@ function renderHistory(host, checks) {
     .reverse()
     .forEach((c) => {
       const line = el("div", "");
-      line.innerHTML = `#${c.seq} · <b class="pill ${c.verdict}">${c.verdict}</b> · ${when(c.checked_at)} · ${short(c.caller)}`;
+      const missing = (c.unmet || []).length ? ` · missing ${c.unmet.join(", ")}` : "";
+      line.innerHTML = `#${c.seq} · <b class="pill ${c.verdict}">${c.verdict}</b>${missing} · ${when(c.checked_at)} · ${short(c.caller)}`;
       box.append(line);
       if (c.quote) {
         const q = el("div", "");
@@ -156,11 +157,35 @@ function renderHistory(host, checks) {
 function renderWatch(w, checks) {
   const card = el("div", "watch");
   const head = el("div", "meta");
+  head.append(el("span", `pill ${w.state || "active"}`, w.state || "active"));
   head.append(el("span", `pill ${w.last_verdict || "unchecked"}`, w.last_verdict || "unchecked"));
   head.append(el("span", "pill", `${w.checks} check${w.checks === "1" ? "" : "s"}`));
   card.append(head);
 
   card.append(el("h3", "", w.claim));
+
+  if ((w.requirements || []).length > 1) {
+    const list = el("ol", "reqs");
+    w.requirements.forEach((line, i) => {
+      const missing = (w.unmet || []).includes(i + 1);
+      const row = el("li", missing ? "missing" : "");
+      row.append(document.createTextNode(line));
+      if (missing) row.append(el("span", "tag", "missing"));
+      list.append(row);
+    });
+    card.append(list);
+  }
+
+  if ((w.unmet || []).length > 0) {
+    const parts = [`missing ${w.unmet.join(", ")}`, w.material ? "material" : "cosmetic"];
+    card.append(el("div", "kv", parts.join(" · ")));
+  }
+  if (w.state === "breached") {
+    card.append(el("div", "kv breach", `cure window ends ${when(w.cure_deadline)}`));
+  }
+  if (w.state === "cured") {
+    card.append(el("div", "kv", `${w.breaches} breach on record · cured ${when(w.last_checked_at)}`));
+  }
   const url = el("div", "kv");
   url.innerHTML = `page <a href="${w.url}" target="_blank" rel="noreferrer">${w.url.replace(/^https?:\/\//, "").slice(0, 56)}</a>`;
   card.append(url);
@@ -195,6 +220,8 @@ async function refresh() {
       ["Checks", stats.checks],
       ["Supported", stats.last_verdicts.supported || 0],
       ["Contradicted", stats.last_verdicts.contradicted || 0],
+      ["Breached", (stats.states && stats.states.breached) || 0],
+      ["Cured", (stats.states && stats.states.cured) || 0],
     ];
     for (const [k, v] of cells) {
       const c = el("div", "stat");
