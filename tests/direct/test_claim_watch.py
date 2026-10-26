@@ -8,6 +8,7 @@ side read can be inspected rather than assumed.
 """
 
 import json
+from datetime import datetime, timezone
 
 CONTRACT = "contracts/claim_watch.py"
 
@@ -35,11 +36,24 @@ def mock_page(direct_vm, body):
     direct_vm.mock_web(WATCH_URL, {"status": 200, "body": body})
 
 
-def mock_verdict(direct_vm, marker, verdict, quote="rulings are stored on chain"):
+def mock_verdict(direct_vm, marker, verdict, quote="rulings are stored on chain", unmet=None, material=False):
     direct_vm.mock_llm(
         rf"(?s).*{marker}.*",
-        json.dumps({"verdict": verdict, "quote": quote, "reason": f"page said {marker}"}),
+        json.dumps(
+            {
+                "verdict": verdict,
+                "unmet": unmet or [],
+                "material": material,
+                "quote": quote,
+                "reason": f"page said {marker}",
+            }
+        ),
     )
+
+
+MULTI_CLAIM = """Rulings are stored on chain together with the quote they relied on.
+Every check is a full consensus round.
+Anyone may run a check on a watch."""
 
 
 class TestCreate:
@@ -208,3 +222,182 @@ class TestValidatorEvidence:
         assert len(fetches) == 2, "the validator did not read the page itself"
         assert fetches[0] == fetches[1] == "https://example.com/claimwatch"
         assert agreed is False, "validator agreed while reading a different page"
+
+
+class TestBreachLayer:
+    """A verdict becomes a consequence: material loss breaches, wording does not."""
+
+    def watch(self, contract, direct_vm, direct_alice, watch_id="watch-1"):
+        direct_vm.sender = direct_alice
+        contract.create_watch(watch_id, "https://example.com/claimwatch", MULTI_CLAIM)
+        return watch_id
+
+    def test_the_claim_is_split_into_requirements(self, direct_vm, direct_deploy, direct_alice):
+        contract = deploy(direct_deploy)
+        self.watch(contract, direct_vm, direct_alice)
+        watch = contract.get_watch("watch-1")
+        assert len(watch["requirements"]) == 3
+        assert watch["requirements"][1].startswith("Every check")
+        assert watch["state"] == "active"
+
+    def test_more_than_six_requirements_are_refused(self, direct_vm, direct_deploy, direct_alice):
+        contract = deploy(direct_deploy)
+        direct_vm.sender = direct_alice
+        with direct_vm.expect_revert("at most 6 requirements"):
+            contract.create_watch("watch-1", "https://example.com/claimwatch", "\n".join(f"promise {i}" for i in range(7)))
+
+    def test_a_material_contradiction_breaches_the_watch(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = deploy(direct_deploy)
+        self.watch(contract, direct_vm, direct_alice)
+
+        mock_page(direct_vm, CHANGED_PAGE)
+        mock_verdict(direct_vm, "not stored", "contradicted", quote="rulings are not stored", unmet=[1, 2], material=True)
+
+        direct_vm.sender = direct_bob
+        result = contract.run_check("watch-1")
+
+        assert result["state"] == "breached"
+        assert result["unmet"] == [1, 2]
+        assert result["material"] is True
+
+        watch = contract.get_watch("watch-1")
+        assert watch["state"] == "breached"
+        assert watch["unmet"] == [1, 2]
+        assert int(watch["cure_deadline"]) == int(watch["breach_at"]) + 7 * 24 * 3600
+        assert watch["breaches"] == "1"
+
+        assert contract.is_breached("https://example.com/claimwatch") is True
+        assert contract.is_breached("https://example.com/other") is False
+        assert [b["id"] for b in contract.breaches(0, 10)] == ["watch-1"]
+        assert contract.stats()["states"]["breached"] == 1
+
+    def test_a_cosmetic_contradiction_keeps_the_watch_active(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = deploy(direct_deploy)
+        self.watch(contract, direct_vm, direct_alice)
+
+        mock_page(direct_vm, CHANGED_PAGE)
+        mock_verdict(direct_vm, "not stored", "contradicted", quote="rulings are not stored", unmet=[1], material=False)
+
+        direct_vm.sender = direct_bob
+        assert contract.run_check("watch-1")["state"] == "active"
+        assert contract.get_watch("watch-1")["state"] == "active"
+        assert contract.is_breached("https://example.com/claimwatch") is False
+        assert contract.breaches(0, 10) == []
+
+    def test_a_second_contradiction_does_not_restart_the_breach(
+        self, direct_vm, direct_deploy, direct_alice, direct_bob
+    ):
+        contract = deploy(direct_deploy)
+        self.watch(contract, direct_vm, direct_alice)
+
+        mock_page(direct_vm, CHANGED_PAGE)
+        mock_verdict(direct_vm, "not stored", "contradicted", quote="rulings are not stored", unmet=[1], material=True)
+        direct_vm.sender = direct_bob
+        contract.run_check("watch-1")
+        first = contract.get_watch("watch-1")
+
+        contract.run_check("watch-1")
+        again = contract.get_watch("watch-1")
+
+        assert again["breaches"] == "1"
+        assert again["breach_at"] == first["breach_at"]
+        assert again["cure_deadline"] == first["cure_deadline"]
+
+    def test_a_supported_check_inside_the_window_cures(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = deploy(direct_deploy)
+        self.watch(contract, direct_vm, direct_alice)
+
+        mock_page(direct_vm, CHANGED_PAGE)
+        mock_verdict(direct_vm, "not stored", "contradicted", quote="rulings are not stored", unmet=[1], material=True)
+        direct_vm.sender = direct_bob
+        contract.run_check("watch-1")
+        assert contract.get_watch("watch-1")["state"] == "breached"
+
+        direct_vm.clear_mocks()
+        mock_page(direct_vm, SUPPORTED_PAGE)
+        mock_verdict(direct_vm, "FETCHED-PAGE ClaimWatch docs", "supported")
+        contract.run_check("watch-1")
+
+        watch = contract.get_watch("watch-1")
+        assert watch["state"] == "cured"
+        assert watch["breaches"] == "1"
+        assert watch["unmet"] == []
+        assert contract.is_breached("https://example.com/claimwatch") is False
+        assert contract.stats()["states"]["cured"] == 1
+
+    def test_a_window_that_closes_turns_the_breach_into_a_failure(
+        self, direct_vm, direct_deploy, direct_alice, direct_bob
+    ):
+        contract = deploy(direct_deploy)
+        self.watch(contract, direct_vm, direct_alice)
+
+        mock_page(direct_vm, CHANGED_PAGE)
+        mock_verdict(direct_vm, "not stored", "contradicted", quote="rulings are not stored", unmet=[3], material=True)
+        direct_vm.sender = direct_bob
+        contract.run_check("watch-1")
+        watch = contract.get_watch("watch-1")
+
+        direct_vm.warp(datetime.fromtimestamp(int(watch["cure_deadline"]) + 60, timezone.utc).isoformat())
+
+        assert contract.get_watch("watch-1")["state"] == "failed"
+        assert contract.is_breached("https://example.com/claimwatch") is True
+        assert contract.stats()["states"]["failed"] == 1
+        with direct_vm.expect_revert("this watch is closed"):
+            contract.run_check("watch-1")
+
+    def test_a_supported_verdict_cannot_name_a_missing_requirement(
+        self, direct_vm, direct_deploy, direct_alice, direct_bob
+    ):
+        contract = deploy(direct_deploy)
+        self.watch(contract, direct_vm, direct_alice)
+
+        mock_page(direct_vm, SUPPORTED_PAGE)
+        mock_verdict(direct_vm, "FETCHED-PAGE ClaimWatch docs", "supported", unmet=[2])
+
+        direct_vm.sender = direct_bob
+        with direct_vm.expect_revert("cannot name a missing requirement"):
+            contract.run_check("watch-1")
+        assert contract.get_watch("watch-1")["checks"] == "0"
+
+    def test_a_requirement_number_that_does_not_exist_is_refused(
+        self, direct_vm, direct_deploy, direct_alice, direct_bob
+    ):
+        contract = deploy(direct_deploy)
+        self.watch(contract, direct_vm, direct_alice)
+
+        mock_page(direct_vm, CHANGED_PAGE)
+        mock_verdict(direct_vm, "not stored", "contradicted", unmet=[9], material=True)
+
+        direct_vm.sender = direct_bob
+        with direct_vm.expect_revert("does not exist in this claim"):
+            contract.run_check("watch-1")
+        assert contract.get_watch("watch-1")["checks"] == "0"
+
+    def test_an_unmet_value_that_is_not_a_number_is_refused(
+        self, direct_vm, direct_deploy, direct_alice, direct_bob
+    ):
+        contract = deploy(direct_deploy)
+        self.watch(contract, direct_vm, direct_alice)
+
+        direct_vm.mock_llm(
+            r"(?s).*not stored.*",
+            json.dumps({"verdict": "contradicted", "unmet": ["first"], "material": True, "quote": "x", "reason": "y"}),
+        )
+        mock_page(direct_vm, CHANGED_PAGE)
+
+        direct_vm.sender = direct_bob
+        with direct_vm.expect_revert("not a number"):
+            contract.run_check("watch-1")
+
+    def test_the_history_keeps_unmet_and_material(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = deploy(direct_deploy)
+        self.watch(contract, direct_vm, direct_alice)
+
+        mock_page(direct_vm, CHANGED_PAGE)
+        mock_verdict(direct_vm, "not stored", "contradicted", quote="rulings are not stored", unmet=[2], material=True)
+        direct_vm.sender = direct_bob
+        contract.run_check("watch-1")
+
+        history = contract.checks_of("watch-1")
+        assert history[0]["unmet"] == [2]
+        assert history[0]["material"] is True

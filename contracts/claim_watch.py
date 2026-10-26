@@ -11,10 +11,22 @@ claim supported, contradicted or unclear, and every ruling stays on chain with
 the quote it was based on.
 
 Lifecycle
-    create_watch   register a claim about a URL, once
-    run_check      validators read the page and rule on the claim
-    get_watch      the claim, its latest ruling and how many checks ran
+    create_watch   register a claim about a URL, once. A claim may carry up to six
+                   numbered requirements, one per line
+    run_check      validators read the page and rule on the claim, and when they
+                   contradict it they also decide which requirements are missing
+                   and whether the loss is material
+    get_watch      the claim, its state, its latest ruling and how many checks ran
     checks_of      every ruling ever recorded for the claim, oldest first
+    is_breached    the one call another contract needs: did this URL break a promise
+    breaches       every watch that broke one, newest first
+
+A verdict alone is not a consequence, so the contract keeps a second state: a
+contradiction that removes something the claim promised, in substance, moves the
+watch to `breached` and starts a seven day cure window. A page that contradicts the
+claim over wording only stays `active` with a note. A supported check inside the
+window makes it `cured`; a window that closes while still breached makes it `failed`,
+and that watch is closed for good.
 
 Any address may run a check: the point is a shared, timestamped record, not a
 private verdict. Each check is a full consensus round, so a watch keeps the
@@ -34,6 +46,13 @@ MAX_URL = 600
 MAX_CLAIM = 600
 MAX_PAGE_CHARS = 6000
 MAX_CHECKS_PER_WATCH = 50
+MAX_REQUIREMENTS = 6
+CURE_WINDOW = 7 * 24 * 3600
+
+ACTIVE = "active"
+BREACHED = "breached"
+CURED = "cured"
+FAILED = "failed"
 
 
 @allow_storage
@@ -47,6 +66,13 @@ class Watch:
     checks: u256
     last_verdict: str
     last_checked_at: u256
+    requirements: str       # the claim split into numbered lines, "" when it is one line
+    unmet: str              # comma separated requirement numbers the page no longer backs
+    material: bool          # the last contradiction removed something in substance
+    state: str
+    breach_at: u256
+    cure_deadline: u256
+    breaches: u256
 
 
 @allow_storage
@@ -60,6 +86,8 @@ class Check:
     quote: str
     reason: str
     checked_at: u256
+    unmet: str
+    material: bool
 
 
 class ClaimWatch(gl.Contract):
@@ -87,6 +115,16 @@ class ClaimWatch(gl.Contract):
             raise gl.vm.UserError("watch not found")
         return watch
 
+    def _state_now(self, watch: Watch) -> str:
+        """A breach whose cure window closed without a supported check is failed.
+
+        Computed on read rather than by a keeper: there is no cron on chain, and a
+        state that silently stays "breached" for a year would be a lie.
+        """
+        if watch.state == BREACHED and int(watch.cure_deadline) > 0 and int(self._now()) > int(watch.cure_deadline):
+            return FAILED
+        return watch.state
+
     def _watch_dict(self, watch: Watch) -> dict:
         return {
             "id": watch.id,
@@ -97,6 +135,13 @@ class ClaimWatch(gl.Contract):
             "checks": str(watch.checks),
             "last_verdict": watch.last_verdict,
             "last_checked_at": str(watch.last_checked_at),
+            "requirements": [line for line in watch.requirements.split("\n") if line.strip()],
+            "unmet": [int(x) for x in watch.unmet.split(",") if x.strip()],
+            "material": watch.material,
+            "state": self._state_now(watch),
+            "breach_at": str(watch.breach_at),
+            "cure_deadline": str(watch.cure_deadline),
+            "breaches": str(watch.breaches),
         }
 
     # ------------------------------------------------------------------- writes
@@ -112,6 +157,11 @@ class ClaimWatch(gl.Contract):
         if len(claim) == 0 or len(claim) > MAX_CLAIM:
             raise gl.vm.UserError("claim must be 1..600 characters")
 
+        lines = [raw.strip() for raw in claim.split("\n") if raw.strip()]
+        if len(lines) > MAX_REQUIREMENTS:
+            raise gl.vm.UserError(f"a claim carries at most {MAX_REQUIREMENTS} requirements")
+        requirements = "" if len(lines) <= 1 else "\n".join(lines)
+
         watch = Watch(
             id=watch_id,
             owner=str(gl.message.sender_address),
@@ -121,6 +171,13 @@ class ClaimWatch(gl.Contract):
             checks=u256(0),
             last_verdict="",
             last_checked_at=u256(0),
+            requirements=requirements,
+            unmet="",
+            material=False,
+            state=ACTIVE,
+            breach_at=u256(0),
+            cure_deadline=u256(0),
+            breaches=u256(0),
         )
         self.watches[watch_id] = watch
         self.watch_ids.append(watch_id)
@@ -130,6 +187,8 @@ class ClaimWatch(gl.Contract):
     def run_check(self, watch_id: str) -> dict:
         """Ask the validator set whether the page still backs the claim."""
         watch = self._load_watch(watch_id)
+        if self._state_now(watch) == FAILED:
+            raise gl.vm.UserError("this watch is closed: the cure window passed while it was breached")
         if int(watch.checks) >= MAX_CHECKS_PER_WATCH:
             raise gl.vm.UserError("this watch has been checked too many times already")
 
@@ -137,6 +196,8 @@ class ClaimWatch(gl.Contract):
         choice = str(verdict.get("verdict", "")).lower()
         if choice not in (SUPPORTED, CONTRADICTED, UNCLEAR):
             raise gl.vm.UserError("no usable verdict was reached")
+        unmet = verdict.get("unmet", [])
+        material = bool(verdict.get("material", False))
 
         seq = watch.checks + u256(1)
         now = self._now()
@@ -149,6 +210,8 @@ class ClaimWatch(gl.Contract):
             quote=str(verdict.get("quote", ""))[:300],
             reason=str(verdict.get("reason", ""))[:400],
             checked_at=now,
+            unmet=",".join(str(n) for n in unmet),
+            material=material,
         )
         self.checks[check.id] = check
         self.check_ids.append(check.id)
@@ -156,6 +219,26 @@ class ClaimWatch(gl.Contract):
         watch.checks = seq
         watch.last_verdict = choice
         watch.last_checked_at = now
+        watch.unmet = ",".join(str(n) for n in unmet)
+        watch.material = material
+
+        # A verdict is not a consequence. Only a material contradiction that names a
+        # requirement the page no longer backs breaks the watch; wording changes leave
+        # it active. A supported check inside the cure window clears a breach.
+        if choice == CONTRADICTED and material and len(unmet) > 0 and watch.state != CURED:
+            if watch.state != BREACHED:
+                watch.state = BREACHED
+                watch.breach_at = now
+                watch.cure_deadline = now + u256(CURE_WINDOW)
+                watch.breaches = watch.breaches + u256(1)
+        elif choice == SUPPORTED:
+            if watch.state == BREACHED:
+                watch.state = CURED
+            elif watch.state == CURED:
+                watch.state = CURED
+            else:
+                watch.state = ACTIVE
+
         self.watches[watch_id] = watch
 
         return {
@@ -163,6 +246,9 @@ class ClaimWatch(gl.Contract):
             "verdict": check.verdict,
             "quote": check.quote,
             "reason": check.reason,
+            "unmet": unmet,
+            "material": material,
+            "state": self._state_now(watch),
         }
 
     # ------------------------------------------------------------------ judging
@@ -174,7 +260,15 @@ class ClaimWatch(gl.Contract):
         round, not once before it: a verdict must rest on a page each validator
         read itself. The page is untrusted input, so it is fenced and the model
         is told to treat it as data rather than instructions.
+
+        When the claim lists several requirements, the answer also says which of
+        them the page no longer backs, and whether losing them is material. That
+        second question is what turns a ruling into a consequence, and it is the
+        part a single reader cannot be trusted with: the page author is the one
+        who benefits from calling a removed promise a wording change.
         """
+        requirements = [line for line in watch.requirements.split("\n") if line.strip()]
+        numbered = "".join(f"{i + 1}. {line}\n" for i, line in enumerate(requirements))
 
         def read_page() -> str:
             try:
@@ -190,6 +284,9 @@ material below.
 
 THE CLAIM
 {watch.claim}
+
+THE REQUIREMENTS
+{numbered if numbered else "(the claim is a single statement, treat it as requirement 1)"}
 
 THE URL
 {watch.url}
@@ -207,18 +304,59 @@ Rules:
 - "contradicted": the page states the opposite, or the thing the claim
   describes is absent where the page should mention it.
 - "unclear": the page is empty, unreadable, or does not address the claim.
+- "unmet" lists the requirement numbers the page no longer backs. Use [] when
+  nothing is missing and when the verdict is unclear.
+- "material" is true only when a requirement that a reader would rely on is gone
+  or reversed: a price, a quantity, a deadline, a promised capability, a named
+  party. A rewording, a moved paragraph or a restyled page is not material.
 - Quote the sentence you relied on, verbatim from the page, at most 200
   characters. If the page is unreadable, leave the quote empty.
 
 Answer as JSON only:
-{{"verdict": "supported" | "contradicted" | "unclear", "quote": "...", "reason": "one or two sentences"}}
+{{"verdict": "supported" | "contradicted" | "unclear", "unmet": [numbers], "material": true | false, "quote": "...", "reason": "one or two sentences"}}
 """
             raw = gl.nondet.exec_prompt(prompt, response_format="json")
             if not isinstance(raw, dict):
                 raise gl.vm.UserError("the model did not return a verdict")
+
+            choice = str(raw.get("verdict", "")).lower().strip()
+            if choice not in (SUPPORTED, CONTRADICTED, UNCLEAR):
+                raise gl.vm.UserError("no usable verdict was reached")
+
+            total = len(requirements) if requirements else 1
+            raw_unmet = raw.get("unmet", [])
+            if not isinstance(raw_unmet, list):
+                raise gl.vm.UserError("the unmet requirements are not a list")
+            unmet = []
+            for item in raw_unmet:
+                if isinstance(item, bool) or not isinstance(item, (int, str)):
+                    raise gl.vm.UserError("an unmet requirement is not a number")
+                try:
+                    n = int(item)
+                except Exception:
+                    raise gl.vm.UserError("an unmet requirement is not a number")
+                if not (1 <= n <= total):
+                    raise gl.vm.UserError(f"requirement {n} does not exist in this claim")
+                if n not in unmet:
+                    unmet.append(n)
+            unmet.sort()
+
+            if choice == SUPPORTED and unmet:
+                raise gl.vm.UserError("a supported verdict cannot name a missing requirement")
+            if choice == UNCLEAR and unmet:
+                raise gl.vm.UserError("an unclear verdict cannot name a missing requirement")
+
+            material = raw.get("material", False)
+            if not isinstance(material, bool):
+                raise gl.vm.UserError("material is not a boolean")
+            if choice != CONTRADICTED:
+                material = False
+
             return json.dumps(
                 {
-                    "verdict": str(raw.get("verdict", "")).lower().strip(),
+                    "verdict": choice,
+                    "unmet": unmet,
+                    "material": material,
                     "quote": str(raw.get("quote", "")).strip()[:300],
                     "reason": str(raw.get("reason", "")).strip()[:400],
                 },
@@ -227,9 +365,11 @@ Answer as JSON only:
 
         principle = (
             "The two answers judge the same claim against the same page. They agree "
-            "when they choose the same verdict (supported, contradicted or unclear). "
-            "The quote and the explanation may be worded differently; a different "
-            "verdict on the same page is a disagreement."
+            "when they choose the same verdict (supported, contradicted or unclear), "
+            "name the same requirement numbers as unmet, and agree on whether the loss "
+            "is material. The quote and the explanation may be worded differently; a "
+            "different verdict, a different set of unmet requirements or a different "
+            "answer on materiality is a disagreement."
         )
         agreed = gl.eq_principle.prompt_comparative(ask, principle=principle)
         result = json.loads(agreed)
@@ -278,8 +418,39 @@ Answer as JSON only:
                     "quote": check.quote,
                     "reason": check.reason,
                     "checked_at": str(check.checked_at),
+                    "unmet": [int(x) for x in check.unmet.split(",") if x.strip()],
+                    "material": check.material,
                 }
             )
+        return out
+
+    @gl.public.view
+    def is_breached(self, url: str) -> bool:
+        """Did this URL break a promise it had made public?"""
+        target = url.strip().lower()
+        for watch_id in self.watch_ids:
+            watch = self.watches.get(watch_id)
+            if watch is None or watch.url.strip().lower() != target:
+                continue
+            if self._state_now(watch) in (BREACHED, FAILED):
+                return True
+        return False
+
+    @gl.public.view
+    def breaches(self, offset: int, limit: int) -> list:
+        if limit <= 0 or limit > 50:
+            limit = 20
+        out = []
+        for watch_id in reversed(self.watch_ids):
+            watch = self.watches.get(watch_id)
+            if watch is None or self._state_now(watch) not in (BREACHED, FAILED):
+                continue
+            if offset > 0:
+                offset -= 1
+                continue
+            out.append(self._watch_dict(watch))
+            if len(out) >= limit:
+                break
         return out
 
     @gl.public.view
@@ -291,8 +462,15 @@ Answer as JSON only:
                 continue
             if watch.last_verdict in counts:
                 counts[watch.last_verdict] += 1
+        states = {ACTIVE: 0, BREACHED: 0, CURED: 0, FAILED: 0}
+        for watch_id in self.watch_ids:
+            watch = self.watches.get(watch_id)
+            if watch is None:
+                continue
+            states[self._state_now(watch)] = states.get(self._state_now(watch), 0) + 1
         return {
             "watches": len(self.watch_ids),
             "checks": len(self.check_ids),
             "last_verdicts": counts,
+            "states": states,
         }
